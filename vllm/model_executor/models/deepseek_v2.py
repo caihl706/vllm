@@ -24,6 +24,9 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import math
+import os
+import sys
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -118,6 +121,390 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+# Debug logging: only fires after `touch $VLLM_DBG_SENTINEL` (default
+# /tmp/vllm_dbg_enable). This lets vLLM's own warmup / dummy runs finish
+# silently; the user turns logging on after `vllm serve` is fully up.
+_DBG_SENTINEL = os.environ.get("VLLM_DBG_SENTINEL", "/tmp/vllm_dbg_enable")
+
+
+# Announce once at import so the user can grep the vLLM startup log to
+# confirm the patched file is actually loaded and see which sentinel path
+# it is checking (useful if VLLM_DBG_SENTINEL was overridden).
+logger.info(
+    "[deepseek_v2 debug] instrumentation loaded; touch %s (rank 0) "
+    "to enable per-layer trace",
+    _DBG_SENTINEL,
+)
+
+
+# DeepseekV2Model is decorated with @support_torch_compile, so any function it
+# calls transitively is a tracing target for TorchDynamo. Without disabling,
+# Dynamo will constant-fold the first `os.path.isfile(sentinel)` return value
+# (typically False during warmup) into the compiled graph — after that,
+# `touch`ing the sentinel would not re-enable prints because the branch was
+# already eliminated. Marking the helpers with @_dynamo_disable forces a graph
+# break at each call so they always run in eager Python.
+try:
+    from torch._dynamo import disable as _dynamo_disable
+except Exception:  # pragma: no cover
+    def _dynamo_disable(fn):
+        return fn
+
+
+@_dynamo_disable
+def _dbg_enabled():
+    if not os.path.isfile(_DBG_SENTINEL):
+        return False
+    try:
+        rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0
+        )
+    except Exception:
+        rank = 0
+    return rank == 0
+
+
+def _dbg_header(caller_frame):
+    caller_file = caller_frame.f_code.co_filename
+    return (
+        f"##info,{os.path.basename(caller_file)}:{caller_frame.f_lineno},"
+        f"pid:{os.getpid()}"
+    )
+
+
+def _get_weight(module):
+    """Best-effort fetch of a linear module's underlying weight tensor."""
+    if module is None:
+        return None
+    for attr in ("weight", "qweight"):
+        w = getattr(module, attr, None)
+        if w is not None:
+            return w
+    return None
+
+
+def _get_scale(module):
+    """Best-effort fetch of a quantized module's weight scale.
+
+    Covers common vLLM patterns:
+      - FP8 block-wise: `weight_scale_inv` (2D)
+      - FP8 per-tensor / INT8 per-channel: `weight_scale`
+    """
+    if module is None:
+        return None
+    for attr in ("weight_scale_inv", "weight_scale"):
+        s = getattr(module, attr, None)
+        if s is not None:
+            return s
+    return None
+
+
+# vLLM / DeepSeek / GLM-5 FP8 block-wise quant uses fixed 128x128 blocks.
+# Inferring block size from `ceil(rows/scale_rows)` is WRONG when rows is not
+# a multiple of 128 (e.g. fused_qkv_a_proj with rows=2624 has scale_rows=21,
+# but the block is still 128x128 with a 64-row zero pad, not a 125-row block).
+_FP8_BLOCK = (128, 128)
+
+
+def _get_moe_expert_params(experts_module):
+    """Extract the actual `w13_weight` / `w2_weight` (+ their scale) from a
+    FusedMoEFactory-built runner.
+
+    In this vLLM version `self.experts` is a `MoERunner` wrapper — the real
+    stacked expert parameters live on `experts_module.routed_experts` (a
+    `RoutedExperts` layer registered by the quant method). A plain
+    `getattr(self.experts, "w13_weight")` returns None because the runner
+    delegates weight storage to its `routed_experts` child.
+
+    Returns a dict with keys ``w13_weight`` / ``w13_scale`` / ``w2_weight``
+    / ``w2_scale`` (values may be None). Handles both FP8 block-wise
+    (``weight_scale_inv``, 3D) and W8A8 int-quantized / FP8 per-channel
+    (``weight_scale``, 1D or 2D) layouts.
+    """
+    if experts_module is None:
+        return {
+            "w13_weight": None,
+            "w13_scale": None,
+            "w2_weight": None,
+            "w2_scale": None,
+        }
+    # Try the runner's inner RoutedExperts first, then fall back to the
+    # object itself for unwrapped implementations.
+    for holder in (getattr(experts_module, "routed_experts", None), experts_module):
+        if holder is None:
+            continue
+        w13 = getattr(holder, "w13_weight", None)
+        w2 = getattr(holder, "w2_weight", None)
+        if w13 is None and w2 is None:
+            continue
+        # NOTE: cannot use `a or b` here because a/b may be tensors, and
+        # `Tensor.__bool__` on numel>1 raises "Boolean value of Tensor with
+        # more than one element is ambiguous". Prefer weight_scale_inv
+        # (FP8 block-wise) over weight_scale (FP8 per-tensor / INT8 per-ch).
+        w13_scale = getattr(holder, "w13_weight_scale_inv", None)
+        if w13_scale is None:
+            w13_scale = getattr(holder, "w13_weight_scale", None)
+        w2_scale = getattr(holder, "w2_weight_scale_inv", None)
+        if w2_scale is None:
+            w2_scale = getattr(holder, "w2_weight_scale", None)
+        return {
+            "w13_weight": w13,
+            "w13_scale": w13_scale,
+            "w2_weight": w2,
+            "w2_scale": w2_scale,
+        }
+    return {
+        "w13_weight": None,
+        "w13_scale": None,
+        "w2_weight": None,
+        "w2_scale": None,
+    }
+
+
+@_dynamo_disable
+def _dbg_moe_router_topk(
+    label_prefix: str,
+    gate: nn.Module,
+    hidden_states: torch.Tensor,
+    top_k: int,
+) -> None:
+    """Recompute the router logits on a small token slice and print top-k
+    expert indices + scores.
+
+    Purpose: locate the layer where FP8 and W8A8 diverge in expert selection.
+    We reuse `gate` (a GateLinear replicated projection), so no TP communication
+    is triggered. To keep log volume manageable and cost negligible, only the
+    first 8 tokens are inspected. Note this is the *naive* top-k on raw
+    router_logits — the real FusedMoE routing may apply grouped-topk /
+    e_score_correction_bias / norm; but for divergence detection the raw signal
+    is sufficient (if raw topk stays aligned, grouped topk almost always does
+    too).
+    """
+    if not _dbg_enabled():
+        return
+    try:
+        with torch.no_grad():
+            sample = hidden_states[:8].contiguous()
+            router_logits, _ = gate(sample)
+            router_logits_f = router_logits.to(torch.float32)
+            k = min(top_k, router_logits_f.shape[-1])
+            top_val, top_idx = torch.topk(router_logits_f, k=k, dim=-1)
+    except Exception as e:
+        _dbg_print((f"{label_prefix}.router_topk", None))
+        print(f"  {label_prefix}.router_topk: ERR={type(e).__name__}:{e}", flush=True)
+        return
+    _dbg_print(
+        (f"{label_prefix}.router_topk_idx[:8]", top_idx),
+        (f"{label_prefix}.router_topk_val[:8]", top_val),
+    )
+
+
+def _dequant_block_sum_2d(w_f: torch.Tensor, s_f: torch.Tensor) -> float:
+    """Sum of `dequant(w) = w * scale_block` for FP8 block-wise 2D weight.
+
+    Mirrors `dequant_fp8_block` in build_mini_glm5_3.py:91-120: block size is
+    fixed at (128, 128); weight is zero-padded to a multiple of the block
+    size before being carved into (row_blocks, col_blocks) tiles. Uses
+    "per-block sum first, then multiply by scale" — mathematically identical
+    to multiply-then-sum but avoids materialising the dequantised tensor.
+    """
+    rows, cols = w_f.shape
+    br, bc = _FP8_BLOCK
+    padded_rows = math.ceil(rows / br) * br
+    padded_cols = math.ceil(cols / bc) * bc
+    row_blocks = padded_rows // br
+    col_blocks = padded_cols // bc
+    if tuple(s_f.shape) != (row_blocks, col_blocks):
+        # Not a 128x128 block layout — fall back to a naive broadcast so the
+        # caller still gets something rather than a silently wrong number.
+        try:
+            return (w_f * s_f).sum().item()
+        except Exception as e:
+            return f"ERR:block-shape-mismatch:{type(e).__name__}:{e}"
+    if (padded_rows, padded_cols) != (rows, cols):
+        padded = torch.zeros(
+            padded_rows, padded_cols, dtype=w_f.dtype, device=w_f.device
+        )
+        padded[:rows, :cols] = w_f
+        w_f = padded
+    per_block_sum = w_f.reshape(row_blocks, br, col_blocks, bc).sum(dim=(1, 3))
+    return (per_block_sum * s_f).sum().item()
+
+
+def _dequant_block_sum_3d(w_f: torch.Tensor, s_f: torch.Tensor) -> float:
+    """Same as `_dequant_block_sum_2d` but with a leading expert axis
+    (FusedMoE `w13_weight` / `w2_weight` are [num_experts, out, in]).
+    Block size is (128, 128) on the (out, in) plane.
+    """
+    n_experts, rows, cols = w_f.shape
+    br, bc = _FP8_BLOCK
+    padded_rows = math.ceil(rows / br) * br
+    padded_cols = math.ceil(cols / bc) * bc
+    row_blocks = padded_rows // br
+    col_blocks = padded_cols // bc
+    if tuple(s_f.shape) != (n_experts, row_blocks, col_blocks):
+        try:
+            return (w_f * s_f).sum().item()
+        except Exception as e:
+            return f"ERR:block-shape-mismatch:{type(e).__name__}:{e}"
+    if (padded_rows, padded_cols) != (rows, cols):
+        padded = torch.zeros(
+            n_experts, padded_rows, padded_cols, dtype=w_f.dtype, device=w_f.device
+        )
+        padded[:, :rows, :cols] = w_f
+        w_f = padded
+    per_block_sum = w_f.reshape(n_experts, row_blocks, br, col_blocks, bc).sum(
+        dim=(2, 4)
+    )
+    return (per_block_sum * s_f).sum().item()
+
+
+def _dequant_weight_sum(w, scale):
+    """Sum of dequantised `w * scale`, matching build_mini_glm5_3.py's
+    convention for the schemes actually stored on live vLLM modules:
+
+      - Per-tensor scale (scalar): `dequant = w * scale`.
+      - Per-output-channel 1D scale (FP8 per-channel, W8A8 int8):
+          2D weight [out, in] -> broadcast on dim 0
+          3D MoE weight [num_experts, out, in] -> broadcast on dim 1
+      - Block-wise 2D scale (FP8 block, typically 128x128):
+          2D weight -> _dequant_block_sum_2d
+          3D MoE weight w/ 3D scale -> _dequant_block_sum_3d (per expert)
+
+    Returns a float sum, or an ``ERR:...`` string when shapes don't line up.
+    W4A16/W8A16 packed weights (`weight_packed`) are checkpoint-only in vLLM;
+    they are unpacked at load time, so we don't handle them here.
+    """
+    if w is None or scale is None:
+        return None
+    try:
+        w_f = w.detach().to(torch.float32)
+        s_f = scale.detach().to(torch.float32)
+
+        # Per-tensor scalar.
+        if s_f.numel() == 1:
+            return (w_f * s_f).sum().item()
+
+        # Per-output-channel (1D scale).
+        if s_f.ndim == 1:
+            if w_f.ndim == 2 and s_f.numel() == w_f.shape[0]:
+                return (w_f * s_f.unsqueeze(-1)).sum().item()
+            if w_f.ndim == 3 and s_f.numel() == w_f.shape[1]:
+                return (w_f * s_f.reshape(1, -1, 1)).sum().item()
+
+        # Block-wise 2D scale for a 2D linear weight.
+        if s_f.ndim == 2 and w_f.ndim == 2:
+            return _dequant_block_sum_2d(w_f, s_f)
+
+        # Block-wise 3D scale for a 3D MoE stacked weight.
+        if s_f.ndim == 3 and w_f.ndim == 3 and s_f.shape[0] == w_f.shape[0]:
+            return _dequant_block_sum_3d(w_f, s_f)
+
+        # Unknown layout — try a naive broadcast; will raise if it fails.
+        return (w_f * s_f).sum().item()
+    except Exception as e:
+        return f"ERR:{type(e).__name__}:{e}"
+
+
+def _print_tensor(name, t, scale=None):
+    if t is None:
+        print(f"  {name}: None", flush=True)
+        return
+    try:
+        shape = tuple(t.shape)
+        dtype = t.dtype
+        if t.numel() == 0:
+            raw = 0.0
+        elif dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            raw = t.detach().to(torch.float32).sum().item()
+        elif dtype in (torch.uint8, torch.int8, torch.int32, torch.int64):
+            raw = t.detach().to(torch.float64).sum().item()
+        else:
+            raw = t.detach().float().sum().item()
+        extra = ""
+        if scale is not None:
+            dq = _dequant_weight_sum(t, scale)
+            if dq is not None:
+                extra = f", dequant_sum={dq}"
+        # For small tensors (e.g. router_topk_idx of shape (8, top_k)),
+        # emit the actual values too — sum alone won't reveal which experts
+        # were selected, and picking the divergence layer needs the indices.
+        values_str = ""
+        if t.numel() <= 128:
+            try:
+                values_str = f", values={t.detach().cpu().tolist()}"
+            except Exception:
+                pass
+        print(
+            f"  {name}: shape={shape}, dtype={dtype}, sum={raw}{extra}{values_str}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"  {name}: ERR={type(e).__name__}:{e}", flush=True)
+
+
+def _dbg_dump_one(name, obj):
+    """Pretty-print one debug item. Accepts:
+
+    - torch.Tensor: printed as-is
+    - nn.Module: auto-extracts .weight and any scale attribute
+                 (weight_scale_inv / weight_scale) and prints both
+                 the raw and dequantized sums so FP8 vs INT8 vs BF16
+                 checkpoints are numerically comparable.
+    - None: printed as None.
+    """
+    if obj is None:
+        print(f"  {name}: None", flush=True)
+        return
+    if isinstance(obj, torch.Tensor):
+        _print_tensor(name, obj)
+        return
+    if isinstance(obj, nn.Module):
+        w = _get_weight(obj)
+        s = _get_scale(obj)
+        _print_tensor(f"{name}.weight", w, scale=s)
+        if s is not None:
+            _print_tensor(f"{name}.weight_scale", s)
+        return
+    print(f"  {name}: unsupported type {type(obj).__name__}", flush=True)
+
+
+@_dynamo_disable
+def _dbg_print(*items):
+    """Print debug info for tensors/modules on rank 0 (after sentinel).
+
+    Each item is one of:
+      - (name, obj) where obj is a torch.Tensor or nn.Module
+      - (name, tensor, scale) where `scale` is applied via _dequant_weight_sum
+        (use this for MoE experts whose stacked weight+scale aren't packaged
+        into a standard nn.Module).
+    """
+    if not _dbg_enabled():
+        return
+    caller_frame = sys._getframe(1)
+    print(_dbg_header(caller_frame), flush=True)
+    for item in items:
+        if len(item) == 2:
+            name, obj = item
+            _dbg_dump_one(name, obj)
+        elif len(item) == 3:
+            name, tensor, scale = item
+            _print_tensor(name, tensor, scale=scale)
+        else:
+            print(f"  ??: unexpected item arity {len(item)}: {item!r}", flush=True)
+
+
+@_dynamo_disable
+def _dbg_msg(msg: str):
+    """Emit a plain ##info header line + message on rank 0 (after sentinel)."""
+    if not _dbg_enabled():
+        return
+    caller_frame = sys._getframe(1)
+    print(f"{_dbg_header(caller_frame)} {msg}", flush=True)
 
 
 def _get_moe_router_dtype(
@@ -221,11 +608,25 @@ class DeepseekAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        _dbg_print(
+            ("DeepseekAttention.input.hidden_states", hidden_states),
+            ("DeepseekAttention.qkv_proj", self.qkv_proj),
+        )
         qkv, _ = self.qkv_proj(hidden_states)
+        _dbg_print(("DeepseekAttention.qkv_proj.output", qkv))
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+        _dbg_print(
+            ("DeepseekAttention.rotary_emb.q", q),
+            ("DeepseekAttention.rotary_emb.k", k),
+        )
         attn_output = self.attn(q, k, v)
+        _dbg_print(
+            ("DeepseekAttention.attn.output", attn_output),
+            ("DeepseekAttention.o_proj", self.o_proj),
+        )
         output, _ = self.o_proj(attn_output)
+        _dbg_print(("DeepseekAttention.output", output))
         return output
 
 
@@ -270,9 +671,19 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        _dbg_print(
+            ("DeepseekV2MLP.input.x", x),
+            ("DeepseekV2MLP.gate_up_proj", self.gate_up_proj),
+        )
         gate_up, _ = self.gate_up_proj(x)
+        _dbg_print(("DeepseekV2MLP.gate_up_proj.output", gate_up))
         x = self.act_fn(gate_up)
+        _dbg_print(
+            ("DeepseekV2MLP.act_fn.output", x),
+            ("DeepseekV2MLP.down_proj", self.down_proj),
+        )
         x, _ = self.down_proj(x)
+        _dbg_print(("DeepseekV2MLP.output", x))
         return x
 
 
@@ -395,6 +806,41 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         already_sequence_parallel: bool = False,
     ) -> torch.Tensor:
+        _moe_params = _get_moe_expert_params(self.experts)
+        _dbg_print(
+            ("DeepseekV2MoE.input.hidden_states", hidden_states),
+            ("DeepseekV2MoE.gate", self.gate),
+            (
+                "DeepseekV2MoE.gate.e_score_correction_bias",
+                getattr(self.gate, "e_score_correction_bias", None),
+            ),
+            (
+                "DeepseekV2MoE.experts.w13_weight",
+                _moe_params["w13_weight"],
+                _moe_params["w13_scale"],
+            ),
+            (
+                "DeepseekV2MoE.experts.w2_weight",
+                _moe_params["w2_weight"],
+                _moe_params["w2_scale"],
+            ),
+        )
+        # Emit top-k routing indices/scores over the first 8 tokens BEFORE
+        # `self.experts(...)`. This is a naive top-k on raw router_logits
+        # (no grouped-topk / e_score_correction_bias applied); good enough
+        # to locate the layer where FP8 and W8A8 first disagree on which
+        # experts win, which is the usual source of exponential activation
+        # drift in deep MoE stacks.
+        _dbg_moe_router_topk(
+            "DeepseekV2MoE",
+            self.gate,
+            hidden_states,
+            top_k=getattr(
+                getattr(self.experts, "moe_config", None),
+                "top_k",
+                8,
+            ),
+        )
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
@@ -406,6 +852,9 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=hidden_states
         )
+        _dbg_print(
+            ("DeepseekV2MoE.experts.output", final_hidden_states),
+        )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -413,7 +862,9 @@ class DeepseekV2MoE(nn.Module):
             )
             final_hidden_states = final_hidden_states[:num_tokens]
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        out = final_hidden_states.view(num_tokens, hidden_dim)
+        _dbg_print(("DeepseekV2MoE.output", out))
+        return out
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -560,25 +1011,61 @@ class DeepseekV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None,
     ) -> torch.Tensor:
+        _dbg_print(
+            ("DeepseekV2Attention.input.hidden_states", hidden_states),
+        )
         if self.q_lora_rank is not None:
+            _dbg_print(
+                ("DeepseekV2Attention.q_a_proj", self.q_a_proj),
+            )
             q = self.q_a_proj(hidden_states)[0]
+            _dbg_print(("DeepseekV2Attention.q_a_proj.output", q))
             q = self.q_a_layernorm(q)
+            _dbg_print(
+                ("DeepseekV2Attention.q_a_layernorm", self.q_a_layernorm),
+                ("DeepseekV2Attention.q_a_layernorm.output", q),
+                ("DeepseekV2Attention.q_b_proj", self.q_b_proj),
+            )
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            _dbg_print(("DeepseekV2Attention.q_b_proj.output", q))
         else:
+            _dbg_print(
+                ("DeepseekV2Attention.q_proj", self.q_proj),
+            )
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
+            _dbg_print(("DeepseekV2Attention.q_proj.output", q))
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        _dbg_print(
+            (
+                "DeepseekV2Attention.kv_a_proj_with_mqa",
+                self.kv_a_proj_with_mqa,
+            ),
+        )
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        _dbg_print(
+            ("DeepseekV2Attention.kv_a_proj_with_mqa.output", latent_cache),
+        )
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a)
+        _dbg_print(
+            ("DeepseekV2Attention.kv_a_layernorm", self.kv_a_layernorm),
+            ("DeepseekV2Attention.kv_a_layernorm.output", kv_a),
+            ("DeepseekV2Attention.kv_b_proj", self.kv_b_proj),
+        )
         kv = self.kv_b_proj(kv_a)[0]
+        _dbg_print(("DeepseekV2Attention.kv_b_proj.output", kv))
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
 
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        _dbg_print(
+            ("DeepseekV2Attention.rotary_emb.q_pe", q_pe),
+            ("DeepseekV2Attention.rotary_emb.k_pe", k_pe),
+        )
 
         q[..., self.qk_nope_head_dim :] = q_pe
         k = torch.empty_like(q)
@@ -594,10 +1081,17 @@ class DeepseekV2Attention(nn.Module):
             v, [0, self.qk_head_dim - self.v_head_dim], value=0
         ).view(-1, self.num_local_heads * self.qk_head_dim)
         attn_output = self.attn(q, k, v)
+        _dbg_print(
+            ("DeepseekV2Attention.attn.output", attn_output),
+        )
         attn_output = attn_output.view(-1, self.num_local_heads, self.qk_head_dim)[
             ..., : self.v_head_dim
         ].reshape(-1, self.num_local_heads * self.v_head_dim)
+        _dbg_print(
+            ("DeepseekV2Attention.o_proj", self.o_proj),
+        )
         output, _ = self.o_proj(attn_output)
+        _dbg_print(("DeepseekV2Attention.output", output))
         return output
 
 
@@ -717,7 +1211,15 @@ class Indexer(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
     ) -> torch.Tensor:
+        _dbg_print(
+            ("Indexer.input.hidden_states", hidden_states),
+            ("Indexer.input.qr", qr),
+            ("Indexer.wq_b", self.wq_b),
+            ("Indexer.wk_weights_proj", self.wk_weights_proj),
+            ("Indexer.k_norm", self.k_norm),
+        )
         q, _ = self.wq_b(qr)
+        _dbg_print(("Indexer.wq_b.output", q))
         q = q.view(-1, self.n_head, self.head_dim)
 
         if current_platform.is_rocm() and self.is_inplace_rope:
@@ -765,7 +1267,14 @@ class Indexer(nn.Module):
             k_pe = k_pe.reshape(-1, self.rope_dim)
             k = torch.cat([k_pe, k_nope], dim=-1)
 
-            return self.indexer_op(hidden_states, q_fp8, k, weights)
+            _dbg_print(
+                ("Indexer.fused.q_fp8", q_fp8),
+                ("Indexer.fused.k", k),
+                ("Indexer.fused.weights", weights),
+            )
+            out = self.indexer_op(hidden_states, q_fp8, k, weights)
+            _dbg_print(("Indexer.output(fused)", out))
+            return out
         else:
             q_pe, q_nope = torch.split(
                 q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
@@ -805,7 +1314,15 @@ class Indexer(nn.Module):
 
         weights = weights * q_scale * self.softmax_scale * self.n_head_scale
 
-        return self.indexer_op(hidden_states, q_fp8, k, weights)
+        _dbg_print(
+            ("Indexer.q_fp8", q_fp8),
+            ("Indexer.q_scale", q_scale),
+            ("Indexer.k", k),
+            ("Indexer.weights", weights),
+        )
+        out = self.indexer_op(hidden_states, q_fp8, k, weights)
+        _dbg_print(("Indexer.output", out))
+        return out
 
 
 def _try_load_fp8_indexer_wk(
@@ -1184,7 +1701,54 @@ class DeepseekV2MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None,
     ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states, llama_4_scaling)
+        _dbg_print(
+            ("DeepseekV2MLAAttention.input.hidden_states", hidden_states),
+            (
+                "DeepseekV2MLAAttention.fused_qkv_a_proj",
+                getattr(self, "fused_qkv_a_proj", None)
+                if self.q_lora_rank is not None
+                else None,
+            ),
+            (
+                "DeepseekV2MLAAttention.kv_a_proj_with_mqa",
+                getattr(self, "kv_a_proj_with_mqa", None)
+                if self.q_lora_rank is None
+                else None,
+            ),
+            (
+                "DeepseekV2MLAAttention.q_a_layernorm",
+                getattr(self, "q_a_layernorm", None)
+                if self.q_lora_rank is not None
+                else None,
+            ),
+            (
+                "DeepseekV2MLAAttention.q_b_proj",
+                getattr(self, "q_b_proj", None)
+                if self.q_lora_rank is not None
+                else None,
+            ),
+            (
+                "DeepseekV2MLAAttention.q_proj",
+                getattr(self, "q_proj", None)
+                if self.q_lora_rank is None
+                else None,
+            ),
+            (
+                "DeepseekV2MLAAttention.kv_a_layernorm",
+                self.kv_a_layernorm,
+            ),
+            (
+                "DeepseekV2MLAAttention.kv_b_proj",
+                self.kv_b_proj,
+            ),
+            (
+                "DeepseekV2MLAAttention.o_proj",
+                self.o_proj,
+            ),
+        )
+        output = self.mla_attn(positions, hidden_states, llama_4_scaling)
+        _dbg_print(("DeepseekV2MLAAttention.output", output))
+        return output
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -1290,6 +1854,31 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        _dbg_msg(
+            f">>> DeepseekV2DecoderLayer starting layer_idx={self.layer_idx} "
+            f"(use_mha={self.use_mha}, "
+            f"mlp={type(self.mlp).__name__}, "
+            f"attn={type(self.self_attn).__name__})"
+        )
+        _dbg_print(
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}].input.hidden_states",
+                hidden_states,
+            ),
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}].input.residual",
+                residual,
+            ),
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}].input_layernorm",
+                self.input_layernorm,
+            ),
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}]."
+                "post_attention_layernorm",
+                self.post_attention_layernorm,
+            ),
+        )
         full_num_tokens = positions.shape[0]
         input_is_sequence_parallel = (
             self.use_sequence_parallel_moe
@@ -1303,6 +1892,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        _dbg_print(
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}].input_layernorm.output",
+                hidden_states,
+            ),
+        )
 
         if input_is_sequence_parallel:
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
@@ -1312,6 +1907,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states = self.self_attn(positions, hidden_states)
         else:
             hidden_states = self.self_attn(positions, hidden_states, llama_4_scaling)
+        _dbg_print(
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}].self_attn.output",
+                hidden_states,
+            ),
+        )
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)
@@ -1338,6 +1939,13 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        _dbg_print(
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}]."
+                "post_attention_layernorm.output",
+                hidden_states,
+            ),
+        )
         if self.use_sequence_parallel_moe:
             hidden_states = self.mlp(
                 hidden_states,
@@ -1354,6 +1962,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             # of DeepseekV2MOE
             hidden_states *= 1.0 / self.routed_scaling_factor
 
+        _dbg_print(
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}].output.hidden_states",
+                hidden_states,
+            ),
+            (
+                f"DeepseekV2DecoderLayer[{self.layer_idx}].output.residual",
+                residual,
+            ),
+        )
         return hidden_states, residual
 
 
