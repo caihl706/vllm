@@ -27,6 +27,7 @@ logger = init_logger(__name__)
 
 class W4A8Int8MoeBackend(Enum):
     CPU_INT4 = "CPU_INT4"
+    CUDA_INT4 = "CUDA_INT4"
 
 
 def _get_priority_backends(
@@ -35,10 +36,12 @@ def _get_priority_backends(
     """
     Get available backends in priority order based on platform and config.
 
-    Currently only CPU INT4 backend is available for W4A8 INT8 MoE.
+    Currently provides Arm CPU and CUDA INT4 backends for W4A8 INT8 MoE.
     """
     if current_platform.is_cpu():
         return [W4A8Int8MoeBackend.CPU_INT4]
+    if current_platform.is_cuda() and current_platform.has_device_capability((7, 5)):
+        return [W4A8Int8MoeBackend.CUDA_INT4]
     return []
 
 
@@ -52,6 +55,12 @@ def backend_to_kernel_cls(
         )
 
         return [CPUExpertsInt4]
+    if backend == W4A8Int8MoeBackend.CUDA_INT4:
+        from vllm.model_executor.layers.fused_moe.experts.cuda_int4_moe import (
+            CUDAExpertsInt4,
+        )
+
+        return [CUDAExpertsInt4]
 
     else:
         raise ValueError(f"Unknown W4A8 Int8 MoE backend: {backend.value}")
@@ -61,6 +70,8 @@ def map_w4a8_int8_backend(runner_backend: MoEBackend) -> W4A8Int8MoeBackend:
     """Map user's MoEBackend to W4A8Int8MoeBackend."""
     mapping = {
         "cpu": W4A8Int8MoeBackend.CPU_INT4,
+        "cuda": W4A8Int8MoeBackend.CUDA_INT4,
+        "triton": W4A8Int8MoeBackend.CUDA_INT4,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -90,7 +101,9 @@ def select_w4a8_int8_moe_backend(
     AVAILABLE_BACKENDS = _get_priority_backends(config)
 
     if not AVAILABLE_BACKENDS:
-        raise NotImplementedError("W4A8 Int8 MoE is only supported on CPU platforms")
+        raise NotImplementedError(
+            "W4A8 Int8 MoE requires an Arm CPU or CUDA SM75+ backend"
+        )
 
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts
