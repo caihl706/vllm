@@ -123,8 +123,13 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
 
         # Register the checkpoint-native packed representation for CUDA.  The
         # CPU path intentionally keeps its unpacked staging tensors because it
-        # repacks them into KleidiAI's private layout after loading.
-        if self.backend == W4A8Int8MoeBackend.CUDA_INT4:
+        # repacks them into KleidiAI's private layout after loading.  The
+        # Triton W4A8 backend consumes the same packed layout as the CUDA
+        # fallback, so both share this branch.
+        if self.backend in (
+            W4A8Int8MoeBackend.CUDA_INT4,
+            W4A8Int8MoeBackend.TRITON_INT4,
+        ):
             if H % 8 != 0 or IN % 8 != 0:
                 raise ValueError(
                     "CUDA W4A8 INT8 requires hidden and intermediate dimensions "
@@ -278,7 +283,10 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
                 raise ValueError(f"{name} output dimension mismatch")
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.backend == W4A8Int8MoeBackend.CUDA_INT4:
+        if self.backend in (
+            W4A8Int8MoeBackend.CUDA_INT4,
+            W4A8Int8MoeBackend.TRITON_INT4,
+        ):
             self._validate_cuda_packed_weights(layer)
             quant_config = self.get_fused_moe_quant_config(layer)
             assert quant_config is not None
