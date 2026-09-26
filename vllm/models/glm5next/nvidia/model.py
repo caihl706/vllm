@@ -314,6 +314,19 @@ class Glm5NextDecoderLayer(nn.Module):
             # on MLA configs; narrow away the `int | None`.
             assert config.v_head_dim is not None
             assert config.kv_lora_rank is not None
+            # 原始 FP8 checkpoint 的 MLA 4 投影 (q_a_proj / kv_a_proj_with_mqa
+            # / q_b_proj / o_proj) 是 BF16 (无 weight_scale_inv)，需要 strip
+            # quant_config 以避免 FP8 通路 (DeepSeekV2FusedQkvAProjLinear 会
+            # 走上 block-FP8 路径)。
+            # 但 compressed-tensors (W8A8-INT8) checkpoint 里这些投影是 INT8，
+            # 由 CT 的 per-module ignore-list 决定每个投影的实际 scheme
+            # (ignored -> UnquantizedLinearMethod = BF16, else INT8)。
+            _mla_quant_config = None
+            if (
+                quant_config is not None
+                and quant_config.get_name() == "compressed-tensors"
+            ):
+                _mla_quant_config = quant_config
             self.self_attn = Glm5NextMLAAttention(
                 vllm_config=vllm_config,
                 config=config,
@@ -326,7 +339,7 @@ class Glm5NextDecoderLayer(nn.Module):
                 kv_lora_rank=config.kv_lora_rank,
                 max_position_embeddings=config.max_position_embeddings,
                 cache_config=cache_config,
-                quant_config=None,  # MLA projections are BF16 in checkpoint
+                quant_config=_mla_quant_config,
                 prefix=f"{prefix}.self_attn",
                 topk_indices_buffer=topk_indices_buffer,
                 skip_rope=getattr(config, "mla_nope", False),
@@ -735,13 +748,17 @@ class Glm5NextModel(nn.Module):
             # Indexer: fuse wk and weights_proj
             (".wk_weights_proj", ".wk", 0),
             (".wk_weights_proj", ".weights_proj", 1),
-            # KDA: merge q, k, v, b, f_a, g_a projections into one GEMM
-            (".in_proj_qkvbfg_a", ".q_proj", 0),
-            (".in_proj_qkvbfg_a", ".k_proj", 1),
-            (".in_proj_qkvbfg_a", ".v_proj", 2),
-            (".in_proj_qkvbfg_a", ".b_proj", 3),
-            (".in_proj_qkvbfg_a", ".f_a_proj", 4),
-            (".in_proj_qkvbfg_a", ".g_a_proj", 5),
+            # KDA: split into two merged linears so INT8 q/k/v and
+            # (possibly BF16) b/f_a/g_a can coexist under compressed-tensors'
+            # uniform-scheme rule on packed modules. Order within each
+            # merged module matches kda.py's in_proj_qkv_a / in_proj_bfg_a
+            # constructor signature.
+            (".in_proj_qkv_a", ".q_proj", 0),
+            (".in_proj_qkv_a", ".k_proj", 1),
+            (".in_proj_qkv_a", ".v_proj", 2),
+            (".in_proj_bfg_a", ".b_proj", 0),
+            (".in_proj_bfg_a", ".f_a_proj", 1),
+            (".in_proj_bfg_a", ".g_a_proj", 2),
         ]
         if self.config.is_moe:
             # Params for weights, fp8 weight scales, fp8 activation scales
@@ -781,9 +798,10 @@ class Glm5NextModel(nn.Module):
                 # the checkpoint. Skip them.
                 continue
 
-            # Handle FP8 indexer WK: dequantize to BF16 for fusion with
-            # weights_proj into wk_weights_proj.
-            if _try_load_fp8_indexer_wk(
+            # Handle quantized indexer.wk: dequantize (FP8 blockwise or INT8
+            # channelwise) to BF16 for fusion with weights_proj into
+            # wk_weights_proj.
+            if _try_load_indexer_wk(
                 name,
                 loaded_weight,
                 _pending_wk_fp8,
@@ -826,8 +844,23 @@ class Glm5NextModel(nn.Module):
                 if ("mlp.experts." in name) and name not in params_dict:
                     continue
                 name_mapped = name.replace(weight_name, param_name)
-                # QKV fusion: skip if fused module doesn't exist in model
-                if param_name == ".fused_qkv_a_proj" and name_mapped not in params_dict:
+                # Fused modules may not exist in every layer (MLA layers don't
+                # have `in_proj_qkv_a` / `in_proj_bfg_a`, linear-attn layers
+                # don't have `fused_qkv_a_proj` / `wk_weights_proj`), or the
+                # fused module may exist as BF16 (no `.weight_scale` param)
+                # when the CT ignore-list covers all shards. In either case
+                # fall through to the next mapping / expert path rather than
+                # KeyError.
+                if (
+                    param_name
+                    in (
+                        ".fused_qkv_a_proj",
+                        ".in_proj_qkv_a",
+                        ".in_proj_bfg_a",
+                        ".wk_weights_proj",
+                    )
+                    and name_mapped not in params_dict
+                ):
                     continue
                 name = name_mapped
                 # Skip loading extra bias for GPTQ models.
@@ -889,6 +922,20 @@ class Glm5NextModel(nn.Module):
 class Glm5NextForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid
 ):
+    # Let compressed-tensors expand fused-module names to their component
+    # shard names for ignore-list / target matching (see
+    # compressed_tensors/utils.py: should_ignore_layer, find_matched_target,
+    # `fused_mapping` param). Without this, custom fused modules such as
+    # `in_proj_qkv_a` cannot be resolved against per-shard ignore regexes
+    # (e.g. `re:.*self_attn\.q_proj$`).
+    packed_modules_mapping = {
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wk_weights_proj": ["wk", "weights_proj"],
+        "in_proj_qkv_a": ["q_proj", "k_proj", "v_proj"],
+        "in_proj_bfg_a": ["b_proj", "f_a_proj", "g_a_proj"],
+    }
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1091,28 +1138,69 @@ def get_spec_layer_idx_from_weight_name(
     return None
 
 
-def _try_load_fp8_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+def _try_load_indexer_wk(name, tensor, buf, params_dict, loaded_params):
+    """Load quantized indexer.wk into the BF16 wk_weights_proj fusion.
+
+    `wk_weights_proj` is a fused BF16 MergedColumnParallelLinear (see
+    attention.py: Indexer.wk_weights_proj, quant_config=None) that packs
+    two shards: `wk` (shard 0, head_dim rows) and `weights_proj` (shard 1,
+    n_head rows). To keep the fusion, we dequantize any quantized `wk`
+    checkpoint tensor to BF16 at load time and slot it into shard 0.
+
+    Two quantized layouts are recognized:
+      * FP8 blockwise (original GLM-5.3-Flash release):
+          .weight is float8_e4m3fn, paired with `.weight_scale_inv`
+          (blockwise scale). Dequant via `scaled_dequantize` with
+          `GroupShape(block, block)`.
+      * INT8 channelwise (compressed-tensors int-quantized, per-output-
+        channel weights): .weight is int8, paired with `.weight_scale`
+        (shape [out_dim, 1] fp32). Dequant by elementwise scale multiply.
+
+    Returns True when the tensor is consumed (buffered or slotted); the
+    outer weight loop then skips its own dispatch for that name.
+    """
     if "indexer.wk." not in name or "wk_weights" in name:
         return False
-    is_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-    is_scale = "weight_scale_inv" in name
-    if not is_weight and not is_scale:
+
+    is_fp8_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+    is_fp8_scale = "weight_scale_inv" in name
+    is_int8_weight = name.endswith(".weight") and tensor.dtype == torch.int8
+    # Guard: `.weight_scale_inv` also endswith("scale") — narrow to the
+    # int-quantized suffix and exclude the FP8 variant explicitly.
+    is_int8_scale = (
+        name.endswith(".weight_scale") and "weight_scale_inv" not in name
+    )
+
+    if not (is_fp8_weight or is_fp8_scale or is_int8_weight or is_int8_scale):
         return False
+
     layer_prefix = name.rsplit(".wk.", 1)[0]
     entry = buf.setdefault(layer_prefix, {})
-    entry["weight" if is_weight else "scale"] = tensor
+    if is_fp8_weight or is_int8_weight:
+        entry["weight"] = tensor
+        entry["kind"] = "fp8" if is_fp8_weight else "int8"
+    else:
+        entry["scale"] = tensor
     if "weight" not in entry or "scale" not in entry:
         return True
 
-    weight_fp8, scale_inv = entry["weight"], entry["scale"]
+    weight_q, scale = entry["weight"], entry["scale"]
+    kind = entry["kind"]
     del buf[layer_prefix]
-    block_size = weight_fp8.shape[1] // scale_inv.shape[1]
-    weight_bf16 = scaled_dequantize(
-        weight_fp8,
-        scale_inv,
-        group_shape=GroupShape(block_size, block_size),
-        out_dtype=torch.bfloat16,
-    )
+
+    if kind == "fp8":
+        block_size = weight_q.shape[1] // scale.shape[1]
+        weight_bf16 = scaled_dequantize(
+            weight_q,
+            scale,
+            group_shape=GroupShape(block_size, block_size),
+            out_dtype=torch.bfloat16,
+        )
+    else:
+        # INT8 channelwise (per-output-channel). `scale` may be [out_dim, 1]
+        # or [out_dim] — normalize to a column vector for broadcast.
+        scale_f32 = scale.to(torch.float32).view(-1, 1)
+        weight_bf16 = (weight_q.to(torch.float32) * scale_f32).to(torch.bfloat16)
 
     fused_name = f"{layer_prefix}.wk_weights_proj.weight"
     param = params_dict[fused_name]

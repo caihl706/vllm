@@ -165,13 +165,31 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        # GLM5-Next keeps the KDA projections BF16 even in fp8 checkpoints (no
-        # weight_scale_inv is stored for them), so strip the quant config for
-        # this layer's construction -- mirrors the MLA path.
+        # GLM5-Next keeps the KDA projections BF16 in the vendor FP8 checkpoint
+        # (no weight_scale_inv is stored for them), so for FP8 block-quant we
+        # strip the quant config here -- mirrors the MLA path.
+        #
+        # For compressed-tensors (W8A8-INT8) checkpoints the KDA projections
+        # MAY be quantized (see quantize_glm5_3_flash_int8_channel.py's
+        # --linear-attn-int8 flag). Keep the quant_config in that case and let
+        # CT's per-module ignore-list decide each projection's scheme; ignored
+        # modules fall back to UnquantizedLinearMethod (equivalent to strip).
         saved_quant_config = vllm_config.quant_config
-        vllm_config.quant_config = None
-        super().__init__(config, vllm_config, prefix)
-        vllm_config.quant_config = saved_quant_config
+        is_ct = (
+            saved_quant_config is not None
+            and saved_quant_config.get_name() == "compressed-tensors"
+        )
+        if not is_ct:
+            vllm_config.quant_config = None
+        try:
+            super().__init__(config, vllm_config, prefix)
+        finally:
+            vllm_config.quant_config = saved_quant_config
+        if is_ct:
+            # Base class recorded self.quant_config from the (possibly cleared)
+            # vllm_config; make sure it holds the real CT config for the
+            # projection constructors below.
+            self.quant_config = saved_quant_config
 
         # Linear-attention head config: read the flattened top-level fields when
         # present (new schema); fall back to the legacy linear_attn_config dict
@@ -198,24 +216,45 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         projection_size = self.head_dim * self.num_heads
         self.local_projection_size = divide(projection_size, self.tp_size)
 
-        # Merge q, k, v, b, f_a, g_a projections into one GEMM (6→1 launches).
-        # Order matches checkpoint's fused_qkvbfg_a_proj convention.
-        # Shards 4 (f_a) and 5 (g_a) are replicated across TP ranks.
-        self.in_proj_qkvbfg_a = _Glm5NextMergedColumnParallelLinear(
+        # Split KDA in-proj into two merged linears (was a single 6-shard
+        # in_proj_qkvbfg_a). compressed-tensors' `should_ignore_layer`
+        # rejects mixed quant-vs-ignored schemes inside one packed module;
+        # keeping q/k/v INT8-capable while b/f_a/g_a stay BF16 (the
+        # iter_0033200 alignment) requires the two groups to live in
+        # separate merged modules. Both take the same hidden_states input,
+        # so this replaces 6→1 with 6→2 GEMM launches — negligible cost.
+        # Order in each merged linear matches the on-disk checkpoint's
+        # shard names via `stacked_params_mapping` in
+        # `Glm5NextForCausalLM.load_weights`.
+        self.in_proj_qkv_a = MergedColumnParallelLinear(
             self.hidden_size,
             [
                 projection_size,  # q (shard 0)
                 projection_size,  # k (shard 1)
                 projection_size,  # v (shard 2)
-                self.num_heads,  # b (shard 3)
-                self.head_dim,  # f_a (shard 4, replicated)
-                self.head_dim,  # g_a (shard 5, replicated)
             ],
-            replicated_shard_ids=(4, 5),
+            bias=False,
+            quant_config=self.quant_config,
+            prefix=f"{prefix}.in_proj_qkv_a",
+        )
+        # b is tp-sharded on num_heads; f_a / g_a are replicated head_dim.
+        # In the aligned INT8 layout these three shards are collectively
+        # kept BF16 via the CT `ignore` list, so `should_ignore_layer`
+        # sees a uniformly-ignored packed module and the whole buffer
+        # loads as BF16. In the full INT8 layout, none of the three is in
+        # `ignore` and CT applies the INT8 scheme to the whole buffer.
+        self.in_proj_bfg_a = _Glm5NextMergedColumnParallelLinear(
+            self.hidden_size,
+            [
+                self.num_heads,  # b (shard 0)
+                self.head_dim,  # f_a (shard 1, replicated)
+                self.head_dim,  # g_a (shard 2, replicated)
+            ],
+            replicated_shard_ids=(1, 2),
             tp_size=self.tp_size,
             bias=False,
             quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_qkvbfg_a",
+            prefix=f"{prefix}.in_proj_bfg_a",
         )
 
         self.f_b_proj = ColumnParallelLinear(
@@ -323,11 +362,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         positions: torch.Tensor,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
-        # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
-        projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-        qkv, beta_raw, f_a, g_a = projected.split(
+        # Two merged GEMMs replace the previous single 6-shard GEMM: q/k/v
+        # go through in_proj_qkv_a (INT8-capable) and b/f_a/g_a go through
+        # in_proj_bfg_a (BF16 or INT8 depending on ignore-list). Same
+        # hidden_states input, so the extra launch cost is negligible.
+        qkv = self.in_proj_qkv_a(hidden_states)[0]
+        bfg_a = self.in_proj_bfg_a(hidden_states)[0]
+        beta_raw, f_a, g_a = bfg_a.split(
             [
-                3 * self.local_projection_size,
                 self.local_num_heads,
                 self.head_dim,
                 self.head_dim,

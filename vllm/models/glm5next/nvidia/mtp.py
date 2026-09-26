@@ -29,7 +29,7 @@ from .model import (
     Glm5NextDecoderLayer,
     Glm5NextMoE,
     _try_load_fp8_attn_proj,
-    _try_load_fp8_indexer_wk,
+    _try_load_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
 from .ops.fused_eh_norm import fused_eh_norm
@@ -338,7 +338,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
                 continue
             name = self._rewrite_spec_layer_name(spec_layer, name)
 
-            if _try_load_fp8_indexer_wk(
+            if _try_load_indexer_wk(
                 name,
                 loaded_weight,
                 _pending_wk_fp8,
