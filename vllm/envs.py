@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
     VLLM_CPU_INT4_W4A8: bool = True
+    VLLM_W4A8_MOE_FUSED: bool = True
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
     VLLM_XLA_CHECK_RECOMPILATION: bool = False
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
@@ -890,6 +891,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # (CPU backend only) whether to use SGLang INT4 W4A8 kernels for AWQ.
     "VLLM_CPU_INT4_W4A8": lambda: bool(int(os.getenv("VLLM_CPU_INT4_W4A8", "1"))),
+    # (CUDA backend) whether the W4A8 INT8 MoE uses the fused Triton expert
+    # kernel (default) or falls back to the per-expert PyTorch implementation.
+    # Set to 0 to disable the fused kernel and use the pre-fused CUDA_INT4
+    # backend (e.g. to isolate the fused kernel during accuracy/perf debugging).
+    # Only affects moe_backend='auto'; an explicit moe_backend still wins.
+    "VLLM_W4A8_MOE_FUSED": lambda: bool(int(os.getenv("VLLM_W4A8_MOE_FUSED", "1"))),
     # If the env var is set, Ray Compiled Graph uses the specified
     # channel type to communicate between workers belonging to
     # different pipeline-parallel stages.
