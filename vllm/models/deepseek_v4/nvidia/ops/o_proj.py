@@ -26,6 +26,40 @@ def compute_fp8_einsum_recipe(
     return einsum_recipe, tma_aligned_scales
 
 
+def _get_cached_wo_a_bf16_from_int8(
+    wo_a: nn.Module, n_groups: int, o_lora_rank: int
+) -> torch.Tensor:
+    """Dequantize an INT8 channelwise ``wo_a`` to bf16 once and cache it.
+
+    ``wo_a`` is read directly here (``is_bmm``), bypassing
+    ``quant_method.apply()``, so the INT8 linear kernel's scale handling never
+    runs. Stopgap: keep the checkpoint INT8 but compute in bf16 (no runtime
+    memory/bandwidth win). TODO: replace with a real grouped INT8 GEMM.
+
+    The INT8 kernel's ``process_weights_after_loading`` may have transposed the
+    weight to (K, N) (Cutlass does), so the layout is recovered from the shape;
+    ``weight_scale`` is per-output-channel, (N, 1).
+    """
+    cached = getattr(wo_a, "_dsv4_wo_a_bf16", None)
+    if cached is not None:
+        return cached
+    weight = wo_a.weight
+    n_out = n_groups * o_lora_rank
+    if weight.shape[0] == n_out and weight.shape[1] != n_out:
+        transposed = False
+    elif weight.shape[1] == n_out and weight.shape[0] != n_out:
+        transposed = True
+    else:  # square-ish ambiguity: a Cutlass-transposed view is non-contiguous
+        transposed = not weight.is_contiguous()
+    w = weight.t() if transposed else weight  # (N, K)
+    assert w.shape[0] == n_out, (w.shape, n_out)
+    scale = wo_a.weight_scale.reshape(-1, 1).float()
+    assert scale.shape[0] == n_out, (scale.shape, n_out)
+    cached = (w.float() * scale).to(torch.bfloat16).view(n_groups, o_lora_rank, -1)
+    wo_a._dsv4_wo_a_bf16 = cached
+    return cached
+
+
 def deep_gemm_fp8_o_proj(
     o: torch.Tensor,
     positions: torch.Tensor,
@@ -78,7 +112,12 @@ def deep_gemm_fp8_o_proj(
             recipe=einsum_recipe,
         )
     else:
-        grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
+        if wo_a.weight.dtype == torch.int8:
+            grouped_weight = _get_cached_wo_a_bf16_from_int8(
+                wo_a, n_groups, o_lora_rank
+            )
+        else:
+            grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
         torch.bmm(
             o_proj_input.transpose(0, 1),
             grouped_weight.transpose(1, 2),

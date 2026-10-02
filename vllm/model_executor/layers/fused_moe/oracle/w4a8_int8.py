@@ -5,6 +5,7 @@ from enum import Enum
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config.kernel import MoEBackend
 from vllm.logger import init_logger
@@ -27,6 +28,8 @@ logger = init_logger(__name__)
 
 class W4A8Int8MoeBackend(Enum):
     CPU_INT4 = "CPU_INT4"
+    CUDA_INT4 = "CUDA_INT4"
+    TRITON_INT4 = "TRITON_INT4"
 
 
 def _get_priority_backends(
@@ -35,10 +38,27 @@ def _get_priority_backends(
     """
     Get available backends in priority order based on platform and config.
 
-    Currently only CPU INT4 backend is available for W4A8 INT8 MoE.
+    Currently provides Arm CPU, CUDA, and Triton W4A8 INT8 MoE backends.  The
+    Triton fused expert takes precedence on SM75+ CUDA GPUs; the correctness
+    fallback ``CUDA_INT4`` is still tried afterwards so unsupported deployment
+    configurations (e.g. missing tl.dot int8 support, unusual activation) fall
+    back gracefully.
     """
     if current_platform.is_cpu():
         return [W4A8Int8MoeBackend.CPU_INT4]
+    if current_platform.is_cuda() and current_platform.has_device_capability((7, 5)):
+        # ``VLLM_W4A8_MOE_FUSED`` (default on) gates the fused Triton expert.
+        # When disabled, drop it from the priority list so ``auto`` selection
+        # falls back to the pre-fused per-expert ``CUDA_INT4`` backend.  An
+        # explicit ``moe_backend='triton'`` is handled separately and is not
+        # affected by this switch.
+        if envs.VLLM_W4A8_MOE_FUSED:
+            return [W4A8Int8MoeBackend.TRITON_INT4, W4A8Int8MoeBackend.CUDA_INT4]
+        logger.info_once(
+            "VLLM_W4A8_MOE_FUSED=0: fused Triton W4A8 MoE kernel disabled, "
+            "using per-expert CUDA_INT4 backend."
+        )
+        return [W4A8Int8MoeBackend.CUDA_INT4]
     return []
 
 
@@ -52,15 +72,35 @@ def backend_to_kernel_cls(
         )
 
         return [CPUExpertsInt4]
+    if backend == W4A8Int8MoeBackend.CUDA_INT4:
+        from vllm.model_executor.layers.fused_moe.experts.cuda_int4_moe import (
+            CUDAExpertsInt4,
+        )
+
+        return [CUDAExpertsInt4]
+    if backend == W4A8Int8MoeBackend.TRITON_INT4:
+        from vllm.model_executor.layers.fused_moe.experts.triton_w4a8_int8 import (
+            CUDATritonExpertsW4A8Int8,
+        )
+
+        return [CUDATritonExpertsW4A8Int8]
 
     else:
         raise ValueError(f"Unknown W4A8 Int8 MoE backend: {backend.value}")
 
 
 def map_w4a8_int8_backend(runner_backend: MoEBackend) -> W4A8Int8MoeBackend:
-    """Map user's MoEBackend to W4A8Int8MoeBackend."""
+    """Map user's MoEBackend to W4A8Int8MoeBackend.
+
+    ``triton`` and ``cuda`` now select distinct backends: the former is the
+    fused Triton W4A8 kernel introduced alongside this selector, the latter
+    keeps the per-expert PyTorch correctness fallback.  ``cpu`` still selects
+    the KleidiAI-based Arm backend.
+    """
     mapping = {
         "cpu": W4A8Int8MoeBackend.CPU_INT4,
+        "cuda": W4A8Int8MoeBackend.CUDA_INT4,
+        "triton": W4A8Int8MoeBackend.TRITON_INT4,
     }
     if backend := mapping.get(runner_backend):
         return backend
@@ -90,7 +130,9 @@ def select_w4a8_int8_moe_backend(
     AVAILABLE_BACKENDS = _get_priority_backends(config)
 
     if not AVAILABLE_BACKENDS:
-        raise NotImplementedError("W4A8 Int8 MoE is only supported on CPU platforms")
+        raise NotImplementedError(
+            "W4A8 Int8 MoE requires an Arm CPU or CUDA SM75+ backend"
+        )
 
     activation_format = (
         mk.FusedMoEActivationFormat.BatchedExperts

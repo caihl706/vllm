@@ -17,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.w4a8_int8 import (
+    W4A8Int8MoeBackend,
     convert_to_w4a8_int8_moe_format,
     make_w4a8_int8_moe_kernel,
     make_w4a8_int8_moe_quant_config,
@@ -120,7 +121,68 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         def _n_scale_cols(in_features: int) -> int:
             return 1 if g == -1 else (in_features // g)
 
-        # Register unpacked int4-as-int8 weights the loader will fill.
+        # Register the checkpoint-native packed representation for CUDA.  The
+        # CPU path intentionally keeps its unpacked staging tensors because it
+        # repacks them into KleidiAI's private layout after loading.  The
+        # Triton W4A8 backend consumes the same packed layout as the CUDA
+        # fallback, so both share this branch.
+        if self.backend in (
+            W4A8Int8MoeBackend.CUDA_INT4,
+            W4A8Int8MoeBackend.TRITON_INT4,
+        ):
+            if H % 8 != 0 or IN % 8 != 0:
+                raise ValueError(
+                    "CUDA W4A8 INT8 requires hidden and intermediate dimensions "
+                    "to be divisible by 8"
+                )
+            w13 = torch.nn.Parameter(
+                torch.empty(E, 2 * IN, H // 8, dtype=torch.int32),
+                requires_grad=False,
+            )
+            w2 = torch.nn.Parameter(
+                torch.empty(E, H, IN // 8, dtype=torch.int32),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_packed", w13)
+            layer.register_parameter("w2_weight_packed", w2)
+            set_weight_attrs(w13, extra_weight_attrs)
+            set_weight_attrs(w2, extra_weight_attrs)
+
+            scale_dtype = torch.bfloat16
+            w13_s = torch.nn.Parameter(
+                torch.ones(E, 2 * IN, 1, dtype=scale_dtype), requires_grad=False
+            )
+            w2_s = torch.nn.Parameter(
+                torch.ones(E, H, 1, dtype=scale_dtype), requires_grad=False
+            )
+            scale_attrs = {"quant_method": "channel", **extra_weight_attrs}
+            set_weight_attrs(w13_s, scale_attrs)
+            set_weight_attrs(w2_s, scale_attrs)
+            layer.register_parameter("w13_weight_scale", w13_s)
+            layer.register_parameter("w2_weight_scale", w2_s)
+
+            # Compressed-tensors emits one [out_dim, in_dim] metadata tensor
+            # per logical projection.  It is retained for checkpoint
+            # compatibility and validation, but is not used by the kernel.
+            w13_shape = torch.nn.Parameter(
+                torch.empty(E, 2, dtype=torch.int32), requires_grad=False
+            )
+            w2_shape = torch.nn.Parameter(
+                torch.empty(E, 2, dtype=torch.int32), requires_grad=False
+            )
+            layer.register_parameter("w13_weight_shape", w13_shape)
+            layer.register_parameter("w2_weight_shape", w2_shape)
+            set_weight_attrs(w13_shape, extra_weight_attrs)
+            set_weight_attrs(w2_shape, extra_weight_attrs)
+
+            layer.w13_in_features = H
+            layer.w13_out_features = 2 * IN
+            layer.w2_in_features = IN
+            layer.w2_out_features = H
+            layer.group_size = g
+            return
+
+        # CPU staging tensors: int4 values represented as int8 in [-8, 7].
         w13 = torch.nn.Parameter(
             torch.empty(E, 2 * IN, H, dtype=torch.int8), requires_grad=False
         )
@@ -133,11 +195,7 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w2, extra_weight_attrs)
         layer.register_parameter("w2_weight", w2)
 
-        # Register scales
-        # KleidiAI groupwise kernels accepts float32 scales
-        # KleidiAI groupwise kernels accepts bfloat16 scales
         scale_dtype = torch.float32 if g == -1 else torch.bfloat16
-
         w13_s = torch.nn.Parameter(
             torch.ones(E, 2 * IN, _n_scale_cols(H), dtype=scale_dtype),
             requires_grad=False,
@@ -171,7 +229,7 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)
 
-        # Placeholders for packed weights (will be replaced after packing)
+        # Placeholders for packed weights (will be replaced after packing).
         layer.register_parameter(
             "w13_weight_packed", torch.nn.Parameter(torch.empty(0), requires_grad=False)
         )
@@ -182,7 +240,6 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         )
         set_weight_attrs(layer.w2_weight_packed, extra_weight_attrs)
 
-        # dims for 4 bit fused matmuls
         layer.w13_in_features = H
         layer.w13_out_features = 2 * IN
         layer.w2_in_features = IN
@@ -190,7 +247,61 @@ class CompressedTensorsW4A8Int8MoEMethod(CompressedTensorsMoEMethod):
         layer.group_size = g
 
     # post-load packing to dyn-4bit KleidiAI kernel's format
+    @staticmethod
+    def _validate_cuda_packed_weights(layer: torch.nn.Module) -> None:
+        for name, packed, scale, shape in (
+            (
+                "w13",
+                layer.w13_weight_packed,
+                layer.w13_weight_scale,
+                layer.w13_weight_shape,
+            ),
+            (
+                "w2",
+                layer.w2_weight_packed,
+                layer.w2_weight_scale,
+                layer.w2_weight_shape,
+            ),
+        ):
+            if packed.dtype != torch.int32:
+                raise TypeError(
+                    f"{name} packed weight must be int32, got {packed.dtype}"
+                )
+            if scale.dtype != torch.bfloat16:
+                raise TypeError(
+                    f"{name} weight scale must be bfloat16, got {scale.dtype}"
+                )
+            if packed.ndim != 3 or scale.ndim != 3 or scale.shape[-1] != 1:
+                raise ValueError(
+                    f"invalid {name} packed/scale shapes: {packed.shape}, {scale.shape}"
+                )
+            if shape.dtype != torch.int32 or shape.shape[-1] != 2:
+                raise ValueError(
+                    f"invalid {name} weight_shape parameter: {shape.shape}"
+                )
+            if packed.shape[1] != scale.shape[1]:
+                raise ValueError(f"{name} output dimension mismatch")
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.backend in (
+            W4A8Int8MoeBackend.CUDA_INT4,
+            W4A8Int8MoeBackend.TRITON_INT4,
+        ):
+            self._validate_cuda_packed_weights(layer)
+            quant_config = self.get_fused_moe_quant_config(layer)
+            assert quant_config is not None
+            assert self.experts_cls is not None
+            self.moe_kernel = make_w4a8_int8_moe_kernel(
+                moe_quant_config=quant_config,
+                moe_config=self.moe,
+                experts_cls=self.experts_cls,
+                routing_tables=layer._expert_routing_tables(),
+            )
+            self.moe_kernel.fused_experts.set_scales(
+                layer.w13_weight_scale, layer.w2_weight_scale
+            )
+            return
+
         # Use oracle to pack weights.
         w13_packed, w2_packed, w13_weight_scale, w2_weight_scale, w13_bias, w2_bias = (
             convert_to_w4a8_int8_moe_format(
