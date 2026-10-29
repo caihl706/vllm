@@ -614,6 +614,12 @@ class HYV4Model(nn.Module):
                         weight_loader(param, loaded_weight, stacked_shard_id)
             loaded_params.add(name)
 
+        if pending_wk_fp8:
+            raise ValueError(
+                "Incomplete FP8/INT8 indexer wk weight/scale pairs: "
+                + ", ".join(sorted(pending_wk_fp8))
+            )
+
         return loaded_params
 
 
