@@ -97,6 +97,7 @@ def _make_deepseek_v4_vl_weights_mapper(
         orig_to_new_regex=base.orig_to_new_regex,
         orig_to_new_suffix={
             "head.weight": "language_model.lm_head.weight",
+            "head.weight_scale": "language_model.lm_head.weight_scale",
             "embed.weight": "embed_tokens.weight",
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
         },

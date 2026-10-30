@@ -55,6 +55,7 @@ from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
+    _head_quant_config,
     _linear_scale_param_name,
     _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
@@ -147,6 +148,7 @@ class DSparkDeepseekV4Model(nn.Module):
             draft_vocab_size,
             config.dspark_markov_rank,
             prefix=maybe_prefix(prefix, "markov_head"),
+            quant_config=_head_quant_config(vllm_config),
         )
         self.confidence_head: DSparkConfidenceHead | None = None
         if getattr(config, "enable_confidence_head", True):

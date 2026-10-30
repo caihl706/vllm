@@ -1440,6 +1440,13 @@ def _linear_scale_param_name(vllm_config: VllmConfig, expert_dtype: str) -> str:
     return "weight_scale" if use_mxfp8 else "weight_scale_inv"
 
 
+def _head_quant_config(vllm_config: VllmConfig):
+    quant_config = vllm_config.quant_config
+    if quant_config is not None and quant_config.get_name() == "compressed-tensors":
+        return quant_config
+    return None
+
+
 def _make_deepseek_v4_weights_mapper(
     expert_dtype: str, linear_scale_name: str = "weight_scale_inv"
 ) -> WeightsMapper:
@@ -1482,6 +1489,7 @@ def _make_deepseek_v4_weights_mapper(
         orig_to_new_regex=scale_regex,
         orig_to_new_suffix={
             "head.weight": "lm_head.weight",
+            "head.weight_scale": "lm_head.weight_scale",
             "embed.weight": "embed_tokens.weight",
             ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
         },
@@ -1573,6 +1581,7 @@ class DeepseekV41LLMForCausalLM(
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=_head_quant_config(vllm_config),
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
         else:

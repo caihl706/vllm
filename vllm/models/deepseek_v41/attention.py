@@ -22,9 +22,11 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.layers.sparse_mqa_indexer import SparseMQAIndexer
+from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.common.ops.sequence_parallel import sp_reduce_scatter
 from vllm.models.deepseek_v41.common.ops import (
@@ -80,6 +82,23 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+class _DequantInt8WoAMethod(UnquantizedLinearMethod):
+    """Dequantize an INT8 channelwise ``wo_a`` to the model dtype after loading.
+
+    ``wo_a`` is consumed by a hand-written grouped BMM that only reads a plain
+    (N, K) weight, so the INT8 checkpoint is expanded to match a BF16 one.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight.data.float() * layer.weight_scale.data.float()
+        replace_parameter(layer, "weight", weight.to(torch.get_default_dtype()))
+        for name in ("weight_scale", "input_scale", "input_zero_point", "azp_adj"):
+            if hasattr(layer, name):
+                delattr(layer, name)
+        layer.scheme = None
+        super().process_weights_after_loading(layer)
 
 
 def _replace_layer_index(prefix: str, layer_id: int) -> str:
@@ -390,6 +409,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_local_groups
+        if self.wo_a.weight.dtype == torch.int8:
+            self.wo_a.quant_method = _DequantInt8WoAMethod()
         self._o_proj_block_size = (
             32 if getattr(self.wo_a, "weight_block_size", None) == [1, 32] else 128
         )
