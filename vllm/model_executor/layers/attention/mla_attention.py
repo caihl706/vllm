@@ -380,7 +380,7 @@ def _get_kv_b_proj_input_dtype(
 ) -> torch.dtype | None:
     weight = getattr(kv_b_proj, "weight", None)
     weight_dtype = weight.dtype if weight is not None else kv_b_proj.params_dtype
-    if weight_dtype == torch.int32:
+    if weight_dtype in (torch.int32, torch.int8):
         return kv_b_proj.params_dtype
     if weight_dtype == torch.uint8:
         return None
