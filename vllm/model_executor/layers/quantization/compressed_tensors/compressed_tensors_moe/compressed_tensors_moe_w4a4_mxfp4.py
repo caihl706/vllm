@@ -61,7 +61,11 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
         # repacks weights and scales, and the megakernels take the checkpoint
         # tensors as they are.
         self.use_cutlass_mxfp4 = CutlassExpertsMxfp4._supports_current_device()
-        if moe.moe_backend == "b12x" or is_flashinfer_moe_ep_backend(moe.moe_backend):
+        if (
+            moe.moe_backend == "b12x"
+            or moe.moe_backend == "emulation"
+            or is_flashinfer_moe_ep_backend(moe.moe_backend)
+        ):
             self.mxfp4_backend, experts_cls = select_mxfp4_moe_backend(moe)
             assert experts_cls is not None
             self.experts_cls = experts_cls
@@ -220,7 +224,12 @@ class CompressedTensorsW4A4Mxfp4MoEMethod(CompressedTensorsMoEMethod):
             replace_parameter(layer, "w2_weight", w2)
             replace_parameter(layer, "w13_weight_scale", w13_scale)
             replace_parameter(layer, "w2_weight_scale", w2_scale)
-        elif self.mxfp4_backend in B12X_BACKENDS or current_platform.is_xpu():
+        elif (
+            self.mxfp4_backend in B12X_BACKENDS
+            or self.mxfp4_backend == Mxfp4MoeBackend.EMULATION
+            or current_platform.is_xpu()
+        ):
+            # b12x / emulation / XPU consume the checkpoint packing as-is.
             pass
         else:
             logger.warning_once(
