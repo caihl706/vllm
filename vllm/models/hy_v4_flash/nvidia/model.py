@@ -28,7 +28,7 @@ from .moe import HYV4FlashFeedForward, HYV4FlashMoE
 
 _EXPERT_WEIGHT = re.compile(
     r"(.*\.experts)\.(?:(\d+)\.)?(gate_proj|up_proj|down_proj|gate_up_proj)"
-    r"(\.weight(?:_scale(?:_inv)?)?|_scale(?:_inv)?)?"
+    r"(\.weight(?:_scale(?:_inv)?|_packed|_shape)?|_scale(?:_inv)?)?"
 )
 
 
@@ -91,6 +91,9 @@ def validate_runtime(vllm_config: VllmConfig) -> None:
             raise ValueError(
                 "Flash online quantization requires MoE-only fp8_per_block"
             )
+    elif quantization == "humming":
+        # PATCH(humming): 量化由 humming 后端按 config 管理,不做 blockwise 校验
+        pass
     elif quantization is not None:
         raise ValueError("HYV4 Flash supports only FP8 blockwise quantization")
 
@@ -235,6 +238,15 @@ class HYV4FlashModel(HYV4Model):
             expert = _EXPERT_WEIGHT.fullmatch(name)
             if expert:
                 prefix, expert_id, projection, suffix = expert.groups()
+                if suffix == ".weight_shape":
+                    # compressed-tensors 的原始形状元数据,Marlin 路径不使用;
+                    # 只登记为已加载以通过"全部权重已初始化"检查
+                    shape_name = "w2_weight" if projection == "down_proj" else "w13_weight"
+                    shape_target = f"{prefix}.routed_experts.{shape_name}_shape"
+                    if shape_target not in parameters:
+                        raise ValueError(f"Unknown Flash expert weight: {name}")
+                    loaded.add(shape_target)
+                    continue
                 shards = {
                     "gate_proj": ("w1",),
                     "up_proj": ("w3",),

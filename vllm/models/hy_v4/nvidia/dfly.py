@@ -379,7 +379,10 @@ class HYV4DFlyForCausalLM(nn.Module):
                 continue
             dtype = (
                 param.dtype
-                if param.dtype == torch.float8_e4m3fn
+                # PATCH(int4 dfly): pack-quantized 的 weight_packed 是 int32、weight_shape 是
+                # int64,保留参数自身 dtype,不要求 bfloat16。
+                if param.dtype
+                in (torch.float8_e4m3fn, torch.int8, torch.int32, torch.int64)
                 or name.endswith((".weight_scale", ".weight_scale_inv"))
                 else torch.bfloat16
             )
@@ -423,15 +426,26 @@ class HYV4DFlyForCausalLM(nn.Module):
                         self.model.layers
                     ):
                         raise ValueError(f"Unexpected DFly weight {name!r}")
+                    # PATCH(int4 dfly): pack-quantized 的 FFN 权重名为 weight_packed,dim 1
+                    # (输入维)按 32/num_bits 压缩,dim 0(输出维)不变。gate/up_proj 的 dim 0
+                    # 就是 FFN 宽度,可直接推断;down_proj 的宽度落在已压缩的 dim 1,不可用,
+                    # 交给已有的 pending 机制等 gate/up 先确定宽度。
                     if leaf in (
                         "gate_proj.weight",
                         "up_proj.weight",
                         "down_proj.weight",
+                        "gate_proj.weight_packed",
+                        "up_proj.weight_packed",
                     ):
                         if weight.ndim != 2 or min(weight.shape) < 1:
                             raise ValueError(f"Invalid DFly FFN weight shape: {name}")
+                        packed = leaf.endswith(".weight_packed")
                         down = leaf == "down_proj.weight"
-                        if weight.shape[0 if down else 1] != self.config.hidden_size:
+                        if packed:
+                            # 压缩后无法直接比较,退化为整除性检查(hidden = dim1 * 32/num_bits)
+                            if self.config.hidden_size % weight.shape[1]:
+                                raise ValueError(f"Invalid DFly FFN hidden size: {name}")
+                        elif weight.shape[0 if down else 1] != self.config.hidden_size:
                             raise ValueError(f"Invalid DFly FFN hidden size: {name}")
                         self.model.materialize_ffn(weight.shape[1 if down else 0])
                         required.update(self._required_weights())

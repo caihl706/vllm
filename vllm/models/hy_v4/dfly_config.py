@@ -34,6 +34,38 @@ def _validate_block_fp8_config(config: object) -> None:
         ):
             raise ValueError(error)
         return
+    # PATCH(W4A8/W8A8 INT): accept compressed-tensors INT4/INT8 weights
+    # (channel/group, symmetric, static) with dynamic per-token INT8 activations.
+    def _is_int_group(group):
+        w = group.get("weights") if isinstance(group, dict) else None
+        a = group.get("input_activations") if isinstance(group, dict) else None
+        return (
+            isinstance(w, dict)
+            and isinstance(a, dict)
+            and w.get("type") == "int"
+            and w.get("num_bits") in (4, 8)
+            and w.get("symmetric") is True
+            and w.get("dynamic") is False
+            and w.get("strategy") in ("channel", "group")
+            and a.get("type") == "int"
+            and a.get("num_bits") == 8
+            and a.get("symmetric") is True
+            and a.get("dynamic") is True
+            and a.get("strategy") == "token"
+            and group.get("output_activations") is None
+            and group.get("format") in (None, "pack-quantized", "int-quantized")
+        )
+
+    if config.get("quant_method") == "compressed-tensors" and config.get(
+        "format"
+    ) in ("pack-quantized", "int-quantized"):
+        int_groups = config.get("config_groups")
+        if (
+            isinstance(int_groups, dict)
+            and int_groups
+            and all(_is_int_group(g) for g in int_groups.values())
+        ):
+            return
     if (
         config.get("quant_method") != "compressed-tensors"
         or config.get("format") != "float-quantized"
@@ -42,6 +74,30 @@ def _validate_block_fp8_config(config: object) -> None:
     groups = config.get("config_groups")
     if not isinstance(groups, dict) or not groups:
         raise ValueError(error)
+    # PATCH(per-channel FP8): also accept W8A8 FP8 with per-output-channel
+    # weights and dynamic per-token activations.
+    def _is_channel_token(group):
+        w = group.get("weights") if isinstance(group, dict) else None
+        a = group.get("input_activations") if isinstance(group, dict) else None
+        return (
+            isinstance(w, dict)
+            and isinstance(a, dict)
+            and w.get("num_bits") == 8
+            and w.get("type") == "float"
+            and w.get("strategy") == "channel"
+            and w.get("symmetric") is True
+            and w.get("dynamic") is False
+            and a.get("num_bits") == 8
+            and a.get("type") == "float"
+            and a.get("strategy") == "token"
+            and a.get("symmetric") is True
+            and a.get("dynamic") is True
+            and group.get("output_activations") is None
+            and group.get("format") in (None, "float-quantized")
+        )
+
+    if all(_is_channel_token(g) for g in groups.values()):
+        return
     expected_weight = dict(
         num_bits=8,
         type="float",
@@ -200,8 +256,12 @@ class HYV4DFlySpeculatorConfig(DFlySpeculatorConfig):
             raise ValueError(f"DFly requires a {cls.target_model_type} target model")
         if str(target.dtype) != "torch.bfloat16":
             raise ValueError("DFly requires a BF16 target dtype")
+        # PATCH(humming): humming 目标由 humming 管理 INT4 专家与 INT8 草稿层
+        checkpoint_humming = target.quantization == "humming"
         checkpoint_fp8 = target.quantization in ("fp8", "compressed-tensors")
-        if checkpoint_fp8:
+        if checkpoint_humming:
+            pass
+        elif checkpoint_fp8:
             _validate_block_fp8_config(target.model_arch_config.quantization_config)
         elif target.quantization is not None:
             from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
@@ -219,7 +279,20 @@ class HYV4DFlySpeculatorConfig(DFlySpeculatorConfig):
                     "DFly supports only unquantized targets, checkpoint blockwise "
                     "FP8 or online MoE-only fp8_per_block quantization"
                 )
-        if checkpoint_fp8:
+        if checkpoint_humming:
+            if draft.quantization not in (
+                None,
+                "humming",
+                "compressed-tensors",
+            ) or spec.quantization not in (
+                None,
+                "humming",
+            ):
+                raise ValueError(
+                    "DFly humming draft must use humming quantization, "
+                    f"got draft={draft.quantization!r} spec={spec.quantization!r}"
+                )
+        elif checkpoint_fp8:
             if draft.quantization != target.quantization or spec.quantization not in (
                 None,
                 target.quantization,
@@ -228,7 +301,9 @@ class HYV4DFlySpeculatorConfig(DFlySpeculatorConfig):
                     "DFly must use the checkpoint's FP8 draft quantization"
                 )
             _validate_block_fp8_config(draft.model_arch_config.quantization_config)
-        elif draft.quantization is not None or spec.quantization is not None:
+        elif not checkpoint_humming and (
+            draft.quantization is not None or spec.quantization is not None
+        ):
             raise ValueError("DFly does not support quantized draft weights")
         parallel = spec.target_parallel_config
         for field in (
