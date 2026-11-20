@@ -91,6 +91,10 @@ class HYV4MoEFused(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         enable_eplb: bool = False,
+        *,
+        routed_hidden_size: int | None = None,
+        routed_input_transform: nn.Module | None = None,
+        routed_output_transform: nn.Module | None = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -148,12 +152,20 @@ class HYV4MoEFused(nn.Module):
         raw_swiglu_limit = getattr(config, "swiglu_limit", 0)
         use_swiglu_clamp = bool(raw_swiglu_limit) and float(raw_swiglu_limit) > 0
         moe_swiglu_limit = float(raw_swiglu_limit) if use_swiglu_clamp else None
+        if routed_input_transform is not None:
+            self.routed_expert_down_proj = routed_input_transform
+        if routed_output_transform is not None:
+            self.routed_expert_up_proj = routed_output_transform
 
         self.experts = FusedMoEFactory(
             num_experts=self.n_routed_experts,
             top_k=top_k,
-            hidden_size=config.hidden_size,
+            hidden_size=(
+                config.hidden_size if routed_hidden_size is None else routed_hidden_size
+            ),
             intermediate_size=intermediate_size,
+            routed_input_transform=routed_input_transform,
+            routed_output_transform=routed_output_transform,
             renormalize=config.route_norm,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",

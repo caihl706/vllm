@@ -114,6 +114,7 @@ DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
         "GlmMoeDsaForCausalLM",
         "HYV4ForCausalLM",
         "HYV4MTPModel",
+        "HYV4DFlyModel",
         "InklingForCausalLM",
         "InklingForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
@@ -150,7 +151,14 @@ def default_breakable_cudagraph_architectures() -> frozenset[str]:
         # recipe can start.
         # HYV4 also runs without torch.compile, preserving runtime-shape
         # kernel selection during graph capture.
-        return frozenset({"DeepseekV41ForCausalLM", "HYV4ForCausalLM", "HYV4MTPModel"})
+        return frozenset(
+            {
+                "DeepseekV41ForCausalLM",
+                "HYV4ForCausalLM",
+                "HYV4VLForConditionalGeneration",
+                "HYV4MTPModel",
+            }
+        )
     if current_platform.is_cuda():
         # Qwen3.5 migrates to breakable CUDA graphs on NVIDIA only; other
         # platforms keep the torch.compile path.
