@@ -393,7 +393,10 @@ class HYV4DFlyForCausalLM(nn.Module):
                 continue
             dtype = (
                 param.dtype
-                if param.dtype == torch.float8_e4m3fn
+                # PATCH(int dfly, from fork commit dfb6f4a8cb): INT8 / pack-quantized
+                # weights keep their own dtype instead of requiring bfloat16.
+                if param.dtype
+                in (torch.float8_e4m3fn, torch.int8, torch.int32, torch.int64)
                 or name.endswith((".weight_scale", ".weight_scale_inv"))
                 else torch.bfloat16
             )

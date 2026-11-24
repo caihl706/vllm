@@ -132,23 +132,37 @@ def prepare_moe_param(tensor: torch.Tensor, name: str, extra_attrs: dict[str, An
     return param
 
 
-def compressed_tensors_get_config(config: dict[str, Any], key: str):
+def compressed_tensors_get_config(config: dict[str, Any], key: str, prefix: str = ""):
     assert key in ["weights", "input_activations"]
-    target_group_config = None
+    # PATCH(multi-group): 原实现只认字面量 "Linear" 且命中即 break,同一模型里只有一个 group
+    # 能生效,其余 group(例如主干 INT8)的 "re:" 目标被完全忽略,那些层会被按错误的 schema
+    # 建参数(表现为 RowvLLMParameter ... missing 'input_dim')。这里先按 "re:" 目标精确匹配
+    # 本层 prefix,匹配不到再退回 "Linear",保持原有行为。
+    selected = None
+    fallback = None
     for group_config in config["config_groups"].values():
-        if "Linear" in group_config["targets"]:
-            if "weights" not in group_config:
-                return None
-            if key not in group_config or group_config[key] is None:
-                return None
-            target_group_config = group_config[key].copy()
+        targets = group_config.get("targets", [])
+        if prefix and any(
+            t.startswith("re:") and re.match(t[3:], prefix) for t in targets
+        ):
+            selected = group_config
             break
-
-    if target_group_config is None:
+        if fallback is None and "Linear" in targets:
+            fallback = group_config
+    if selected is None:
+        selected = fallback
+    if selected is None:
         return None
+    if "weights" not in selected:
+        return None
+    if key not in selected or selected[key] is None:
+        return None
+    target_group_config = selected[key].copy()
     target_group_config["quant_method"] = config["quant_method"]
     if config["quant_method"] == "compressed-tensors":
-        target_group_config["format"] = config["format"]
+        # PATCH(multi-group): group 可自带 format(INT4 组 pack-quantized、INT8 组 int-quantized),
+        # 顶层 format 只作缺省值;否则 INT8 层会被当成 pack-quantized 去找 weight_packed 参数。
+        target_group_config["format"] = selected.get("format", config["format"])
     elif config["quant_method"] == "modelopt":
         target_group_config["quant_algo"] = config["quant_algo"]
     return target_group_config
@@ -231,7 +245,7 @@ class HummingConfig(QuantizationConfig):
             return None
 
         if config["quant_method"] in ["compressed-tensors", "modelopt"]:
-            group_config = compressed_tensors_get_config(config, "weights")
+            group_config = compressed_tensors_get_config(config, "weights", prefix)
             if group_config is None:
                 return None
             config = group_config
@@ -246,7 +260,9 @@ class HummingConfig(QuantizationConfig):
         if self.is_layer_skipped(config, prefix):
             return None
         if config["quant_method"] in ["compressed-tensors", "modelopt"]:
-            group_config = compressed_tensors_get_config(config, "input_activations")
+            group_config = compressed_tensors_get_config(
+                config, "input_activations", prefix
+            )
             if group_config is None:
                 return None
             config = group_config

@@ -40,6 +40,9 @@ def _validate_checkpoint_quantization(config: object) -> None:
         "float-quantized",
         "mxfp4-pack-quantized",
         "mixed-precision",
+        # PATCH(W4A8/W8A8 INT): int checkpoints use these top-level formats.
+        "pack-quantized",
+        "int-quantized",
     ):
         raise ValueError(error)
     groups = config.get("config_groups")
@@ -89,7 +92,39 @@ def _validate_checkpoint_quantization(config: object) -> None:
             and all(weights.get(k) == v for k, v in expected_mxfp4_weight.items())
             and weights.get("scale_dtype") in (None, "uint8", "torch.uint8")
         )
-        if not (is_fp8 or is_mxfp4):
+        # PATCH(per-channel FP8): also accept W8A8 FP8 with per-output-channel
+        # static symmetric weights and dynamic per-token activations.
+        is_channel_token = (
+            group_format == "float-quantized"
+            and isinstance(activations, dict)
+            and weights.get("num_bits") == 8
+            and weights.get("type") == "float"
+            and weights.get("strategy") == "channel"
+            and weights.get("symmetric") is True
+            and weights.get("dynamic") is False
+            and activations.get("num_bits") == 8
+            and activations.get("type") == "float"
+            and activations.get("strategy") == "token"
+            and activations.get("symmetric") is True
+            and activations.get("dynamic") is True
+        )
+        # PATCH(W4A8/W8A8 INT): static symmetric INT4/INT8 (channel/group) weights
+        # with dynamic per-token INT8 activations.
+        is_int = (
+            group_format in ("pack-quantized", "int-quantized")
+            and isinstance(activations, dict)
+            and weights.get("type") == "int"
+            and weights.get("num_bits") in (4, 8)
+            and weights.get("symmetric") is True
+            and weights.get("dynamic") is False
+            and weights.get("strategy") in ("channel", "group")
+            and activations.get("type") == "int"
+            and activations.get("num_bits") == 8
+            and activations.get("symmetric") is True
+            and activations.get("dynamic") is True
+            and activations.get("strategy") == "token"
+        )
+        if not (is_fp8 or is_mxfp4 or is_channel_token or is_int):
             raise ValueError(error)
 
 
@@ -229,8 +264,12 @@ class HYV4DFlySpeculatorConfig(DFlySpeculatorConfig):
             raise ValueError(f"DFly requires a {cls.target_model_type} target model")
         if str(target.dtype) != "torch.bfloat16":
             raise ValueError("DFly requires a BF16 target dtype")
+        # PATCH(humming): humming 目标由 humming 管理 INT4 专家与 INT8 草稿层
+        checkpoint_humming = target.quantization == "humming"
         checkpoint_quantized = target.quantization in ("fp8", "compressed-tensors")
-        if checkpoint_quantized:
+        if checkpoint_humming:
+            pass
+        elif checkpoint_quantized:
             _validate_checkpoint_quantization(
                 target.model_arch_config.quantization_config
             )
@@ -250,7 +289,17 @@ class HYV4DFlySpeculatorConfig(DFlySpeculatorConfig):
                     "DFly supports only unquantized targets, checkpoint blockwise "
                     "FP8/MXFP4 or online MoE-only fp8_per_block quantization"
                 )
-        if checkpoint_quantized:
+        if checkpoint_humming:
+            if draft.quantization not in (
+                None,
+                "humming",
+                "compressed-tensors",
+            ) or spec.quantization not in (None, "humming"):
+                raise ValueError(
+                    "DFly humming draft must use humming quantization, "
+                    f"got draft={draft.quantization!r} spec={spec.quantization!r}"
+                )
+        elif checkpoint_quantized:
             if draft.quantization != target.quantization or spec.quantization not in (
                 None,
                 target.quantization,
@@ -259,7 +308,9 @@ class HYV4DFlySpeculatorConfig(DFlySpeculatorConfig):
             _validate_checkpoint_quantization(
                 draft.model_arch_config.quantization_config
             )
-        elif draft.quantization is not None or spec.quantization is not None:
+        elif not checkpoint_humming and (
+            draft.quantization is not None or spec.quantization is not None
+        ):
             raise ValueError("DFly does not support quantized draft weights")
         parallel = spec.target_parallel_config
         cls.verify_target_parallel_config(spec)

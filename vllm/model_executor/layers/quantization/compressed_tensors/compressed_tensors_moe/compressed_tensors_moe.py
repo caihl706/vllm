@@ -188,6 +188,21 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 weight_quant, input_quant, layer.moe_config
             )
         elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
+            if current_platform.is_cuda():
+                # PATCH(w4a8-int marlin, from fork commit dfb6f4a8cb): the W4A8 INT
+                # oracle is CPU-only, so route CUDA to the WNA16 Marlin MoE
+                # (INT4 weights, BF16 activations in this vLLM build).
+                from .compressed_tensors_moe_wna16 import (
+                    CompressedTensorsWNA16MoEMethod,
+                )
+
+                logger.info_once(
+                    "Using CompressedTensorsWNA16MoEMethod for W4A8-INT MoE "
+                    "(activations stay BF16 in this build)"
+                )
+                return CompressedTensorsWNA16MoEMethod(
+                    weight_quant, input_quant, layer.moe_config, layer_name
+                )
             from .compressed_tensors_moe_w4a8_int8 import (
                 CompressedTensorsW4A8Int8MoEMethod,
             )
